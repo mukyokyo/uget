@@ -1,4 +1,4 @@
-// uget.cpp v4 - Immortal Multi-Mirror CLI Downloader with SHA-256 & Quiet Mode
+// uget.cpp v4.1 - Immortal Multi-Mirror CLI Downloader with SHA-256 & Quiet Mode
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: (C) 2026 mukyokyo
 //
@@ -62,6 +62,7 @@ constexpr uint64_t kTailMinSplit = 2ULL * 1024 * 1024;
 constexpr uint32_t kMetaMagic = 0x34544755;  // "UGT4"
 constexpr int kMetaSaveTicks = 4;            // x 500 ms
 constexpr double kMiB = 1024.0 * 1024.0;
+constexpr size_t kSidecarLimit = 1024 * 1024;
 
 // A split point is always at least kTailMinSplit past the committed position,
 // so one in-flight write can never cross it.
@@ -70,7 +71,8 @@ static_assert(kTailMinSplit >= 4 * kIoBufSize, "split floor must exceed one in-f
 struct Config {
   std::vector<std::wstring> urls;
   std::wstring output;
-  std::wstring expected_sha256;  // 64-char hex, or "print"
+  std::wstring expected_sha256;  // 64-char hex, "print", or empty
+  bool sha_sidecar = true;
   int threads = 8;
   int max_giveup_streak = 25;  // 0 = infinite
   int timeout_sec = 15;
@@ -551,6 +553,174 @@ ProbeResult ProbeMirrors(HINTERNET hSession, const Config& cfg) {
     InterruptibleSleep(std::min(1000 * attempt, 5000));
   }
   return ProbeResult{};
+}
+
+bool IsSha256Hex(const std::wstring& s) {
+  return s.size() == 64 && s.find_first_not_of(L"0123456789abcdefABCDEF") == std::wstring::npos;
+}
+
+std::wstring Trim(const std::wstring& s) {
+  const size_t b = s.find_first_not_of(L" \t\r");
+  if (b == std::wstring::npos) return L"";
+  return s.substr(b, s.find_last_not_of(L" \t\r") - b + 1);
+}
+
+std::wstring BaseName(const std::wstring& p) {
+  const size_t s = p.find_last_of(L"/\\");
+  return s == std::wstring::npos ? p : p.substr(s + 1);
+}
+
+enum class FetchResult { Ok, Unusable, Unreachable };
+
+FetchResult FetchSmallText(HINTERNET hSession, const Config& cfg, const std::wstring& url, size_t limit, std::string& out) {
+  ParsedUrl pu;
+  if (!ParseUrl(url, pu)) return FetchResult::Unusable;
+  HINTERNET hConn = WinHttpConnect(hSession, pu.host.c_str(), pu.port, 0);
+  RegisterHandle(hConn);
+  HINTERNET hReq = hConn ? OpenGetRequest(hConn, pu, cfg, true) : nullptr;
+
+  FetchResult r = FetchResult::Unreachable;
+  if (hReq && SendAndReceive(hReq, L"")) {
+    r = FetchResult::Unusable;
+    uint64_t len = 0;
+    if (QueryStatus(hReq) == 200 && !(QueryContentLength(hReq, len) && len > limit)) {
+      out.clear();
+      char buf[16384];
+      bool eof = false;
+      for (;;) {
+        DWORD got = 0;
+        if (!WinHttpReadData(hReq, buf, sizeof(buf), &got)) break;
+        if (got == 0) {
+          eof = true;
+          break;
+        }
+        if (out.size() + got > limit) break;
+        out.append(buf, got);
+      }
+      if (eof && !out.empty()) r = FetchResult::Ok;
+    }
+  }
+  CloseAndUnregisterHandle(hReq);
+  CloseAndUnregisterHandle(hConn);
+  return r;
+}
+
+struct ShaEntry {
+  std::wstring hash;
+  std::wstring name;
+};
+
+// Accepts GNU ("hash  name", "hash *name", bare hash) and BSD ("SHA256 (name) = hash") lines.
+// Any other non-comment line rejects the whole body, which filters out soft-404 HTML pages.
+bool ParseShaList(const std::string& body, std::vector<ShaEntry>& out) {
+  out.clear();
+  if (body.find('\0') != std::string::npos) return false;
+  const size_t bom = body.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
+  const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, body.data() + bom, (int)(body.size() - bom), nullptr, 0);
+  if (n <= 0) return false;
+  std::wstring text(n, L'\0');
+  MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, body.data() + bom, (int)(body.size() - bom), text.data(), n);
+
+  for (size_t start = 0; start < text.size();) {
+    size_t nl = text.find(L'\n', start);
+    if (nl == std::wstring::npos) nl = text.size();
+    std::wstring line = Trim(text.substr(start, nl - start));
+    start = nl + 1;
+    if (line.empty() || line[0] == L'#') continue;
+    if (line[0] == L'\\') line.erase(0, 1);
+
+    ShaEntry e;
+    if (line.size() >= 64 && IsSha256Hex(line.substr(0, 64)) &&
+        (line.size() == 64 || line[64] == L' ' || line[64] == L'\t')) {
+      e.hash = line.substr(0, 64);
+      size_t p = line.find_first_not_of(L" \t", 64);
+      if (p != std::wstring::npos) {
+        if (line[p] == L'*') ++p;
+        e.name = line.substr(p);
+      }
+    } else if (line.compare(0, 6, L"SHA256") == 0) {
+      const size_t lp = line.find(L'(');
+      const size_t rp = line.rfind(L')');
+      const size_t eq = line.rfind(L'=');
+      if (lp == std::wstring::npos || line.find_first_not_of(L' ', 6) != lp || rp == std::wstring::npos || rp < lp ||
+          eq == std::wstring::npos || eq < rp) {
+        return false;
+      }
+      e.hash = Trim(line.substr(eq + 1));
+      e.name = line.substr(lp + 1, rp - lp - 1);
+      if (!IsSha256Hex(e.hash)) return false;
+    } else {
+      return false;
+    }
+    e.hash = ToLower(e.hash);
+    out.push_back(std::move(e));
+  }
+  return !out.empty();
+}
+
+bool PickSha(const std::vector<ShaEntry>& entries, const std::vector<std::wstring>& names, bool per_file, std::wstring& out) {
+  if (per_file && entries.size() == 1) {
+    out = entries[0].hash;
+    return true;
+  }
+  std::wstring found;
+  for (const auto& e : entries) {
+    const std::wstring b = ToLower(BaseName(e.name));
+    if (b.empty()) continue;
+    for (const auto& n : names) {
+      if (n.empty() || ToLower(n) != b) continue;
+      if (!found.empty() && found != e.hash) return false;
+      found = e.hash;
+    }
+  }
+  if (found.empty()) return false;
+  out = found;
+  return true;
+}
+
+struct SidecarCandidate {
+  std::wstring url;
+  bool per_file;
+};
+
+std::vector<SidecarCandidate> SidecarCandidates(const std::wstring& url) {
+  const std::wstring base = url.substr(0, url.find_first_of(L"?#"));
+  const size_t scheme = base.find(L"://");
+  if (base.find(L'/', scheme == std::wstring::npos ? 0 : scheme + 3) == std::wstring::npos) return {};
+  const size_t last = base.find_last_of(L'/');
+  std::vector<SidecarCandidate> out;
+  if (last + 1 < base.size()) {
+    out.push_back({base + L".sha256", true});
+    out.push_back({base + L".sha256sum", true});
+  }
+  const std::wstring dir = base.substr(0, last + 1);
+  out.push_back({dir + L"SHA256SUMS", false});
+  out.push_back({dir + L"sha256sums.txt", false});
+  return out;
+}
+
+// Best effort: one request per candidate, and an unreachable host skips to the next mirror.
+std::wstring FindSidecarSha256(HINTERNET hSession, const Config& cfg, const ProbeResult& probe, std::wstring& source) {
+  std::vector<std::wstring> urls{probe.origin_url};
+  for (const auto& m : g_mirrors) {
+    if (!m.dead && m.original_url != probe.origin_url) urls.push_back(m.original_url);
+  }
+  for (const auto& url : urls) {
+    const std::vector<std::wstring> names{FilenameFromUrl(url), probe.filename};
+    for (const auto& cand : SidecarCandidates(url)) {
+      if (g_stop.load()) return L"";
+      std::string body;
+      std::vector<ShaEntry> entries;
+      std::wstring hash;
+      const FetchResult r = FetchSmallText(hSession, cfg, cand.url, kSidecarLimit, body);
+      if (r == FetchResult::Unreachable) break;
+      if (r == FetchResult::Ok && ParseShaList(body, entries) && PickSha(entries, names, cand.per_file, hash)) {
+        source = cand.url;
+        return hash;
+      }
+    }
+  }
+  return L"";
 }
 
 bool SelectAndPaceMirror(int worker_id, size_t& out_mirror_idx, std::wstring& out_target_url, bool& out_is_refresh) {
@@ -1115,7 +1285,8 @@ bool ComputeFileSha256(HANDLE hFile, std::wstring& out_hex) {
 std::wstring NormalizeSha256Arg(std::wstring raw) {
   raw = ToLower(raw);
   if (raw.rfind(L"sha256:", 0) == 0) raw = raw.substr(7);
-  if (raw == L"-" || raw == L"auto" || raw == L"show" || raw == L"print") return L"print";
+  if (raw == L"auto") return L"";
+  if (raw == L"-" || raw == L"show" || raw == L"print") return L"print";
   return raw;
 }
 
@@ -1138,7 +1309,7 @@ bool CheckExistingFileMatches(const std::wstring& path, bool size_known, uint64_
 
 void PrintUsage() {
   printf(
-      "uget v4 - Immortal Multi-Mirror CLI Downloader (UCRT + WinHTTP + CNG)\n"
+      "uget v4.1 - Immortal Multi-Mirror CLI Downloader (UCRT + WinHTTP + CNG)\n"
       "Usage: uget [options] <URL1> [URL2 ...]\n\n"
       "Options:\n"
       "  -o, -O <file>        Output filename (default: auto-detect)\n"
@@ -1146,10 +1317,14 @@ void PrintUsage() {
       "  -t <streak>          Give up after N consecutive failed attempts (default: 25, 0=infinite)\n"
       "  --timeout <sec>      Socket timeout and low-speed window in seconds (default: 15)\n"
       "  --min-speed <KiB/s>  Drop a ranged connection slower than this over the window (default: 1, 0=off)\n"
-      "  --sha256 <hash>      Verify SHA-256 after download (or 'print' to just compute & show)\n"
+      "  --sha256 <hash>      Verify against this SHA-256 ('print' to show the digest)\n"
+      "  --no-sha-sidecar     Do not look for a published checksum next to the URL\n"
       "  --http2              Allow HTTP/2 (connections to the same host get multiplexed)\n"
       "  -q, --quiet          Quiet mode (suppress progress bar & info logs)\n"
-      "  -k                   Allow insecure TLS and HTTPS->HTTP redirects\n");
+      "  -k                   Allow insecure TLS and HTTPS->HTTP redirects\n"
+      "\n"
+      "Without a --sha256 hash, <URL>.sha256, <URL>.sha256sum, SHA256SUMS or sha256sums.txt\n"
+      "next to the file is used for verification when one can be found.\n");
 }
 
 int main() {
@@ -1184,6 +1359,8 @@ int main() {
       cfg.min_speed_bps = (uint64_t)std::max(0, _wtoi(argv[++i])) * 1024;
     } else if (arg == L"--sha256" && has_value) {
       cfg.expected_sha256 = NormalizeSha256Arg(argv[++i]);
+    } else if (arg == L"--no-sha-sidecar") {
+      cfg.sha_sidecar = false;
     } else if (arg == L"--http2") {
       cfg.http2 = true;
     } else if (arg == L"-q" || arg == L"--quiet") {
@@ -1208,9 +1385,9 @@ int main() {
     PrintUsage();
     return 1;
   }
-  const bool verify_sha = !cfg.expected_sha256.empty() && cfg.expected_sha256 != L"print";
-  if (verify_sha && (cfg.expected_sha256.size() != 64 ||
-                     cfg.expected_sha256.find_first_not_of(L"0123456789abcdef") != std::wstring::npos)) {
+  const bool print_sha = cfg.expected_sha256 == L"print";
+  std::wstring expected_sha = print_sha ? L"" : cfg.expected_sha256;
+  if (!expected_sha.empty() && !IsSha256Hex(expected_sha)) {
     fprintf(stderr, "[!] --sha256 expects 64 hex characters or 'print'.\n");
     return 1;
   }
@@ -1261,7 +1438,22 @@ int main() {
   const std::wstring meta_file = out_file + L".uget";
   const std::wstring meta_tmp_file = meta_file + L".tmp";
 
-  if (verify_sha && CheckExistingFileMatches(out_file, probe.size_known, probe.total_size, cfg.expected_sha256)) {
+  std::wstring sha_source;
+  if (expected_sha.empty() && cfg.sha_sidecar) {
+    expected_sha = FindSidecarSha256(hSession, cfg, probe, sha_source);
+    if (g_stop.load()) {
+      WinHttpCloseHandle(hSession);
+      fprintf(stderr, "\n[!] Cancelled by Ctrl+C.\n");
+      return 130;
+    }
+    if (!expected_sha.empty()) {
+      LogInfoW(L"[*] SHA-256 from %ls\n", sha_source.c_str());
+    } else {
+      LogInfo("[*] No published checksum found. Integrity will not be verified.\n");
+    }
+  }
+
+  if (!expected_sha.empty() && CheckExistingFileMatches(out_file, probe.size_known, probe.total_size, expected_sha)) {
     LogInfoW(L"[+] '%ls' already exists and SHA-256 matches. Skipping download.\n", out_file.c_str());
     WinHttpCloseHandle(hSession);
     return 0;
@@ -1439,7 +1631,7 @@ int main() {
              final_size / kMiB, (unsigned long long)g_total_retries.load());
     }
 
-    if (!cfg.expected_sha256.empty()) {
+    if (print_sha || !expected_sha.empty()) {
       LogInfo("[*] Calculating SHA-256...\n");
       std::wstring actual_sha256;
       if (!ComputeFileSha256(hFile, actual_sha256)) {
@@ -1447,22 +1639,25 @@ int main() {
         fprintf(stderr, "[!] Failed to compute SHA-256 (or interrupted).\n");
         return g_user_abort.load() ? 130 : 1;
       }
-      if (!verify_sha) {
-        wprintf(L"%ls  %ls\n", actual_sha256.c_str(), out_file.c_str());
-      } else if (actual_sha256 != cfg.expected_sha256) {
+      if (print_sha) wprintf(L"%ls  %ls\n", actual_sha256.c_str(), out_file.c_str());
+      if (!expected_sha.empty() && actual_sha256 != expected_sha) {
         CloseHandle(hFile);
         fwprintf(stderr,
                  L"[!] SHA-256 MISMATCH for '%ls'!\n"
                  L"    Expected: %ls\n"
                  L"    Actual  : %ls\n",
-                 out_file.c_str(), cfg.expected_sha256.c_str(), actual_sha256.c_str());
+                 out_file.c_str(), expected_sha.c_str(), actual_sha256.c_str());
         DeleteFileW(meta_file.c_str());
         DeleteFileW(meta_tmp_file.c_str());
-        DeleteFileW(part_file.c_str());
+        if (sha_source.empty()) {
+          DeleteFileW(part_file.c_str());
+        } else {
+          // A stale published checksum must not trigger an endless re-download loop.
+          fwprintf(stderr, L"    Source  : %ls\n    Kept '%ls' for inspection.\n", sha_source.c_str(), part_file.c_str());
+        }
         return 2;
-      } else {
-        LogInfoW(L"[+] SHA-256 verified OK (%ls)\n", actual_sha256.c_str());
       }
+      if (!expected_sha.empty()) LogInfoW(L"[+] SHA-256 verified OK (%ls)\n", actual_sha256.c_str());
     }
 
     CloseHandle(hFile);
